@@ -2,6 +2,8 @@
 
 Projeto de teste para deteccao facial em tempo real com MediaPipe e classificacao de emocao com MiniXception.
 
+A proposta do projeto eh evoluir para um sistema multimodal em tempo real, com a intencao de funcionar como um NPS continuo capaz de capturar sinais do sentimento do individuo ao longo da interacao.
+
 ## Edge
 
 Este projeto ainda nao esta empacotado nem otimizado para um dispositivo edge offline dedicado.
@@ -25,6 +27,10 @@ Direcao de desenvolvimento:
 - quando houver alternativa equivalente, a preferencia eh por componentes mais leves e mais faceis de portar
 
 ## Visao geral
+
+Conceitualmente, o projeto explora a ideia de um NPS em tempo real: em vez de depender apenas de uma resposta declarada no fim da experiencia, o sistema tenta observar sinais emocionais do individuo ao longo da interacao.
+
+O estado atual ainda eh visual, baseado em video e expressao facial. A direcao do projeto, porem, eh multimodal, incorporando outras fontes de sinal ao longo da evolucao.
 
 O fluxo atual do projeto funciona assim:
 
