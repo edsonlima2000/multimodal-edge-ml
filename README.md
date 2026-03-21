@@ -1,18 +1,29 @@
-# multimodal-edge-ml
+# SENTI
 
-Projeto de teste para deteccao facial em tempo real com MediaPipe e classificacao de emocao com MiniXception.
+Sentiment Extraction from Natural signals in real-Time for Interpretation
 
-A proposta do projeto eh evoluir para um sistema multimodal em tempo real, com a intencao de funcionar como um NPS continuo capaz de capturar sinais do sentimento do individuo ao longo da interacao.
+Projeto de prototipo para NPS multimodal em tempo real, com foco em capturar sinais do sentimento do individuo durante a interacao.
+
+## Objetivo
+
+O projeto busca evoluir para um pipeline multimodal em tempo real que combine sinais visuais e de audio para apoiar uma leitura continua de experiencia.
+
+No estado atual, o prototipo combina:
+
+- emocao facial por video
+- transcricao local do audio
+- sentimento heuristico do texto transcrito
 
 ## Edge
 
-Este projeto ainda nao esta empacotado nem otimizado para um dispositivo edge offline dedicado.
+Este projeto ainda nao esta empacotado nem otimizado para um dispositivo edge offline dedicado, mas ja segue uma direcao edge-aware.
 
 O que eh verdade hoje:
 
 - a inferencia acontece localmente, sem depender de API externa
 - o video eh capturado pela webcam local
-- a deteccao facial e a classificacao de emocao rodam na propria maquina
+- o audio eh capturado pelo microfone local
+- a deteccao facial, a transcricao e a classificacao atual rodam na propria maquina
 
 O que ainda nao afirmamos:
 
@@ -22,22 +33,28 @@ O que ainda nao afirmamos:
 
 Direcao de desenvolvimento:
 
-- a intencao do projeto eh evoluir com foco em edge
-- cada novo componente deve ser avaliado tambem pelo peso computacional e pela facilidade de uso futuro em cenarios mais lite
-- quando houver alternativa equivalente, a preferencia eh por componentes mais leves e mais faceis de portar
+- cada novo componente deve ser avaliado tambem pelo peso computacional e pela facilidade de portar para cenarios mais lite
+- quando houver alternativa equivalente, a preferencia eh por componentes mais leves
+- a estrategia atual privilegia processamento local, streaming e baixo acoplamento entre modalidades
 
-## Visao geral
+## Pipeline atual
 
-Conceitualmente, o projeto explora a ideia de um NPS em tempo real: em vez de depender apenas de uma resposta declarada no fim da experiencia, o sistema tenta observar sinais emocionais do individuo ao longo da interacao.
-
-O estado atual ainda eh visual, baseado em video e expressao facial. A direcao do projeto, porem, eh multimodal, incorporando outras fontes de sinal ao longo da evolucao.
-
-O fluxo atual do projeto funciona assim:
+O fluxo principal do prototipo multimodal funciona assim:
 
 1. a webcam captura o video com OpenCV
 2. o MediaPipe detecta o rosto em cada frame
 3. o recorte facial em escala de cinza eh enviado para o modelo MiniXception
-4. a emocao prevista eh desenhada no video com texto em portugues/ingles
+4. o microfone captura audio em streaming
+5. o Vosk transcreve a fala localmente em portugues
+6. uma heuristica leve classifica o sentimento do texto transcrito
+7. o video exibe a emocao facial, o sentimento do video, a transcricao e o sentimento do audio
+
+## Componentes
+
+### Video
+
+- `MediaPipe Face Detector`: deteccao facial em tempo real
+- `MiniXception`: classificacao de emocao facial
 
 O modelo `MiniXception` usado neste projeto foi treinado no dataset `FER-2013`.
 
@@ -51,25 +68,35 @@ Emocoes exibidas no video:
 - 😲 Surpreso (Surprise)
 - 😐 Neutro (Neutral)
 
+O script tambem deriva um sentimento simplificado para o video:
+
+- `Positivo`
+- `Negativo`
+- `Neutro`
+
+### Audio
+
+- `sounddevice`: captura de audio do microfone
+- `Vosk`: transcricao offline em streaming
+- heuristica textual: sentimento leve sobre o texto reconhecido
+
+O sentimento atual do audio eh uma primeira versao heuristica, pensada para baixo custo computacional. Ele deve ser tratado como baseline de edge, nao como classificador final.
+
 ## Estrutura
 
-- `hello_mediapipe.py`: script principal
+- `hello_mediapipe.py`: baseline visual com MediaPipe + MiniXception
+- `senti.py`: prototipo multimodal com video, audio, transcricao e sentimento
 - `models/blaze_face_short_range.tflite`: detector de rosto usado pelo MediaPipe
-- `models/fer2013_mini_XCEPTION.102-0.66.hdf5`: modelo de emocao
+- `models/fer2013_mini_XCEPTION.102-0.66.hdf5`: modelo de emocao facial
+- `models/vosk-model-small-pt-0.3/`: modelo pequeno de ASR em portugues para o Vosk
+- `requirements.txt`: dependencias diretas do projeto
 
 ## Requisitos
 
 - Windows
 - Python 3.12
 - webcam conectada
-
-Dependencias principais:
-
-- `mediapipe`
-- `opencv-python`
-- `tensorflow`
-- `pillow`
-- `numpy`
+- microfone funcional
 
 ## Ambiente virtual
 
@@ -88,12 +115,18 @@ Ativar no PowerShell:
 Instalar dependencias:
 
 ```powershell
-pip install mediapipe opencv-python tensorflow pillow numpy
+pip install -r requirements.txt
 ```
 
 ## Execucao
 
-Com o ambiente ativado:
+Rodar o prototipo multimodal:
+
+```powershell
+python senti.py
+```
+
+Rodar somente a baseline visual:
 
 ```powershell
 python hello_mediapipe.py
@@ -104,6 +137,6 @@ Para sair da janela do video, pressione `q`.
 ## Observacoes
 
 - o script usa `MediaPipe Tasks`, nao a API antiga `mp.solutions`
-- o overlay do texto usa a fonte de emoji do Windows em `C:\Windows\Fonts\seguiemj.ttf`
-- os modelos necessarios ja estao versionados na pasta `models/`
+- o Vosk foi escolhido nesta fase por ser offline, leve e orientado a streaming
+- o overlay do texto usa fontes do Windows para texto e emoji
 - o estado atual eh de desenvolvimento local com intencao edge, nao de deploy final em dispositivo offline
