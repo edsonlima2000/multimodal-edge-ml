@@ -12,6 +12,7 @@ import cv2
 from huggingface_hub import snapshot_download
 import mediapipe as mp
 import numpy as np
+import opensmile
 from PIL import Image, ImageDraw, ImageFont
 import sounddevice as sd
 import tensorflow as tf
@@ -34,6 +35,11 @@ EMOTION_INFERENCE_MIN_INTERVAL_S = 1.0
 AUDIO_SENTIMENT_PARTIAL_MIN_WORDS = 8
 AUDIO_SENTIMENT_PARTIAL_WORD_STEP = 5
 AUDIO_SENTIMENT_MAX_WORDS = 100
+VOICE_ANALYSIS_WINDOW_S = 2.0
+VOICE_ANALYSIS_STEP_S = 1.0
+VOICE_BASELINE_MIN_WINDOWS = 3
+VOICE_BASELINE_HISTORY = 20
+VOICE_MIN_RMS = 0.01
 
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)
@@ -78,12 +84,25 @@ SENTIMENT_COLORS = {
     "Indisponivel": (120, 120, 120),
 }
 
+VOICE_EMOTION_COLORS = {
+    "Alegria": (0, 190, 255),
+    "Tristeza": (220, 120, 60),
+    "Raiva": (60, 70, 220),
+    "Medo": (180, 90, 180),
+    "Surpresa": (0, 220, 220),
+    "Nojo": (40, 150, 40),
+    "Neutra": (160, 160, 160),
+    "Indisponivel": (120, 120, 120),
+}
+
 
 @dataclass
 class AudioState:
     text: str = "Aguardando audio..."
     sentiment_label: str = "Indisponivel"
     sentiment_color: tuple[int, int, int] = SENTIMENT_COLORS["Indisponivel"]
+    voice_emotion_label: str = "Indisponivel"
+    voice_emotion_color: tuple[int, int, int] = VOICE_EMOTION_COLORS["Indisponivel"]
     status: str = "Audio nao iniciado"
 
 
@@ -125,6 +144,166 @@ class TextSentimentAnalyzer:
         return label, SENTIMENT_COLORS.get(label, SENTIMENT_COLORS["Neutro"])
 
 
+class VoiceEmotionAnalyzer:
+    def __init__(self) -> None:
+        self.smile = opensmile.Smile(
+            feature_set=opensmile.FeatureSet.eGeMAPSv02,
+            feature_level=opensmile.FeatureLevel.Functionals,
+        )
+        self.history: deque[dict[str, float]] = deque(maxlen=VOICE_BASELINE_HISTORY)
+
+    def predict(self, audio_signal: np.ndarray, sample_rate: int) -> tuple[str, tuple[int, int, int]]:
+        metrics = self._extract_metrics(audio_signal, sample_rate)
+        if metrics is None:
+            return "Indisponivel", VOICE_EMOTION_COLORS["Indisponivel"]
+
+        if len(self.history) < VOICE_BASELINE_MIN_WINDOWS:
+            self.history.append(metrics)
+            return "Indisponivel", VOICE_EMOTION_COLORS["Indisponivel"]
+
+        z = self._compute_zscores(metrics)
+        emotion_scores = self._score_emotions(z)
+        emotion_label = self._select_emotion(emotion_scores, z)
+        self.history.append(metrics)
+        return emotion_label, VOICE_EMOTION_COLORS.get(emotion_label, VOICE_EMOTION_COLORS["Neutra"])
+
+    def _extract_metrics(self, audio_signal: np.ndarray, sample_rate: int) -> dict[str, float] | None:
+        signal = audio_signal.astype("float32")
+        if signal.size and float(np.max(np.abs(signal))) > 1.5:
+            signal = signal / 32768.0
+
+        rms = float(np.sqrt(np.mean(np.square(signal)))) if signal.size else 0.0
+        if rms < VOICE_MIN_RMS:
+            return None
+
+        features = self.smile.process_signal(signal, sampling_rate=sample_rate).iloc[0]
+        metrics = {
+            "pitch_mean": float(features["F0semitoneFrom27.5Hz_sma3nz_amean"]),
+            "pitch_peak": float(features["F0semitoneFrom27.5Hz_sma3nz_percentile80.0"]),
+            "pitch_range": float(features["F0semitoneFrom27.5Hz_sma3nz_pctlrange0-2"]),
+            "loudness_mean": float(features["loudness_sma3_amean"]),
+            "loudness_peak": float(features["loudness_sma3_percentile80.0"]),
+            "speech_rate": float(features["VoicedSegmentsPerSec"]),
+            "segment_duration": float(features["MeanVoicedSegmentLengthSec"]),
+            "sound_level": float(features["equivalentSoundLevel_dBp"]),
+        }
+        if any(np.isnan(value) or np.isinf(value) for value in metrics.values()):
+            return None
+        return metrics
+
+    def _compute_zscores(self, metrics: dict[str, float]) -> dict[str, float]:
+        zscores: dict[str, float] = {}
+        for key, value in metrics.items():
+            history_values = np.array([sample[key] for sample in self.history], dtype=np.float32)
+            mean = float(np.mean(history_values))
+            std = float(np.std(history_values))
+            safe_std = max(std, 1e-3)
+            zscores[key] = (value - mean) / safe_std
+        return zscores
+
+    def _score_emotions(self, z: dict[str, float]) -> dict[str, float]:
+        return {
+            "Alegria": (
+                1.25 * z["pitch_mean"]
+                + 1.15 * z["loudness_mean"]
+                + 1.00 * z["speech_rate"]
+                - 0.75 * z["segment_duration"]
+                + 0.45 * z["pitch_peak"]
+            ),
+            "Tristeza": (
+                -1.20 * z["pitch_mean"]
+                - 1.15 * z["loudness_mean"]
+                - 0.90 * z["pitch_range"]
+                - 0.25 * z["speech_rate"]
+            ),
+            "Raiva": (
+                1.70 * z["loudness_peak"]
+                + 0.90 * z["loudness_mean"]
+                + 0.40 * z["sound_level"]
+                + 0.30 * z["pitch_range"]
+            ),
+            "Medo": (
+                1.65 * z["pitch_range"]
+                - 0.90 * z["loudness_mean"]
+                + 0.80 * z["speech_rate"]
+                - 0.65 * z["segment_duration"]
+            ),
+            "Surpresa": (
+                1.75 * z["pitch_peak"]
+                + 1.00 * z["pitch_mean"]
+                + 0.35 * z["pitch_range"]
+                - 0.25 * z["loudness_mean"]
+            ),
+            "Nojo": (
+                1.80 * z["segment_duration"]
+                - 0.90 * z["speech_rate"]
+                + 0.20 * z["loudness_mean"]
+            ),
+        }
+
+    def _select_emotion(self, emotion_scores: dict[str, float], z: dict[str, float]) -> str:
+        max_abs_deviation = max(abs(value) for value in z.values())
+        best_emotion = max(emotion_scores, key=emotion_scores.get)
+        best_score = emotion_scores[best_emotion]
+        ranked_scores = sorted(emotion_scores.values(), reverse=True)
+        score_margin = ranked_scores[0] - ranked_scores[1] if len(ranked_scores) > 1 else ranked_scores[0]
+
+        if max_abs_deviation < 0.65:
+            return "Neutra"
+        if best_score < 1.2 or score_margin < 0.35:
+            return "Indisponivel"
+        if best_emotion in {"Nojo", "Raiva"} and best_score < 1.45:
+            return "Neutra"
+        return best_emotion
+
+
+class VoiceEmotionWorker:
+    def __init__(self, sample_rate: int) -> None:
+        self.sample_rate = sample_rate
+        self.stop_event = threading.Event()
+        self.state_lock = threading.Lock()
+        self.latest_label = "Indisponivel"
+        self.latest_color = VOICE_EMOTION_COLORS["Indisponivel"]
+        self.input_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1)
+        self.analyzer = VoiceEmotionAnalyzer()
+        self.worker_thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.worker_thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=1.0)
+
+    def submit(self, audio_signal: np.ndarray) -> None:
+        signal_copy = audio_signal.copy()
+        try:
+            self.input_queue.put_nowait(signal_copy)
+        except queue.Full:
+            try:
+                _ = self.input_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self.input_queue.put_nowait(signal_copy)
+
+    def get_state(self) -> tuple[str, tuple[int, int, int]]:
+        with self.state_lock:
+            return self.latest_label, self.latest_color
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                audio_signal = self.input_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            label, color = self.analyzer.predict(audio_signal, self.sample_rate)
+            with self.state_lock:
+                self.latest_label = label
+                self.latest_color = color
+
+
 class AudioTranscriber:
     def __init__(self, model_path: Path, sentiment_analyzer: TextSentimentAnalyzer) -> None:
         self.model_path = model_path
@@ -142,6 +321,11 @@ class AudioTranscriber:
         self.sample_rate = 16000
         self.last_classified_text = ""
         self.last_classified_word_count = 0
+        self.voice_buffer: deque[np.ndarray] = deque()
+        self.voice_buffer_sample_count = 0
+        self.total_voice_samples_seen = 0
+        self.last_voice_analysis_total_samples = 0
+        self.voice_worker: VoiceEmotionWorker | None = None
 
     def start(self) -> None:
         if not self.model_path.exists():
@@ -152,6 +336,8 @@ class AudioTranscriber:
         self.model = Model(str(self.model_path))
         self.recognizer = KaldiRecognizer(self.model, self.sample_rate)
         self.recognizer.SetWords(False)
+        self.voice_worker = VoiceEmotionWorker(self.sample_rate)
+        self.voice_worker.start()
 
         self.stream = sd.RawInputStream(
             samplerate=self.sample_rate,
@@ -175,6 +361,8 @@ class AudioTranscriber:
         if self.stream is not None:
             self.stream.stop()
             self.stream.close()
+        if self.voice_worker is not None:
+            self.voice_worker.stop()
         with self.state_lock:
             self.state.status = "Microfone encerrado"
 
@@ -184,6 +372,8 @@ class AudioTranscriber:
                 text=self.state.text,
                 sentiment_label=self.state.sentiment_label,
                 sentiment_color=self.state.sentiment_color,
+                voice_emotion_label=self.state.voice_emotion_label,
+                voice_emotion_color=self.state.voice_emotion_color,
                 status=self.state.status,
             )
 
@@ -202,6 +392,9 @@ class AudioTranscriber:
                 data = self.audio_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+
+            self._update_voice_buffer(np.frombuffer(data, dtype=np.int16))
+            self._maybe_submit_voice_window()
 
             is_final_result = False
             if self.recognizer.AcceptWaveform(data):
@@ -245,6 +438,51 @@ class AudioTranscriber:
                 self.state.text = display_text
                 self.state.sentiment_label = sentiment_label
                 self.state.sentiment_color = sentiment_color
+                if self.voice_worker is not None:
+                    voice_label, voice_color = self.voice_worker.get_state()
+                    self.state.voice_emotion_label = voice_label
+                    self.state.voice_emotion_color = voice_color
+
+    def _update_voice_buffer(self, audio_chunk: np.ndarray) -> None:
+        if audio_chunk.size == 0:
+            return
+
+        self.voice_buffer.append(audio_chunk.copy())
+        self.voice_buffer_sample_count += int(audio_chunk.size)
+        self.total_voice_samples_seen += int(audio_chunk.size)
+
+        max_buffer_samples = int(self.sample_rate * max(VOICE_ANALYSIS_WINDOW_S * 3, 6))
+        while self.voice_buffer and self.voice_buffer_sample_count > max_buffer_samples:
+            removed = self.voice_buffer.popleft()
+            self.voice_buffer_sample_count -= int(removed.size)
+
+    def _maybe_submit_voice_window(self) -> None:
+        if self.voice_worker is None:
+            return
+
+        window_samples = int(self.sample_rate * VOICE_ANALYSIS_WINDOW_S)
+        step_samples = int(self.sample_rate * VOICE_ANALYSIS_STEP_S)
+        if self.voice_buffer_sample_count < window_samples:
+            return
+        if (self.total_voice_samples_seen - self.last_voice_analysis_total_samples) < step_samples:
+            return
+
+        recent_window = self._get_recent_voice_window(window_samples)
+        self.voice_worker.submit(recent_window.astype(np.float32))
+        self.last_voice_analysis_total_samples = self.total_voice_samples_seen
+
+    def _get_recent_voice_window(self, window_samples: int) -> np.ndarray:
+        chunks: list[np.ndarray] = []
+        collected = 0
+
+        for chunk in reversed(self.voice_buffer):
+            chunks.append(chunk)
+            collected += int(chunk.size)
+            if collected >= window_samples:
+                break
+
+        recent_audio = np.concatenate(list(reversed(chunks))) if chunks else np.zeros(window_samples, dtype=np.int16)
+        return recent_audio[-window_samples:]
 
 
 def limit_text_to_last_words(text: str, max_words: int) -> str:
@@ -360,10 +598,10 @@ def draw_label(
     origin: tuple[int, int],
     color: tuple[int, int, int],
 ) -> None:
-    font = load_font(size=28, emoji=True)
+    font = load_font(size=14, emoji=True)
     x, y = origin
     left, top, right, bottom = draw.textbbox((x, y), label, font=font)
-    padding = 8
+    padding = 6
     box = (
         left - padding,
         top - padding,
@@ -423,8 +661,8 @@ def draw_top_transcription_bar(
     frame_width: int,
     transcript: str,
 ) -> None:
-    title_font = load_font(size=22)
-    body_font = load_font(size=22)
+    title_font = load_font(size=18)
+    body_font = load_font(size=14)
     x1, y1, x2 = 20, 18, frame_width - 20
     wrapped_lines = wrap_text_to_width(
         draw,
@@ -455,37 +693,45 @@ def draw_bottom_dashboard(
     frame_height: int,
     video_emotion: str,
     video_sentiment: str,
-    audio_sentiment: str,
+    text_sentiment: str,
+    voice_emotion: str,
+    voice_color: tuple[int, int, int],
     audio_status: str,
 ) -> None:
-    title_font = load_font(size=24)
-    body_font = load_font(size=20)
-    emoji_font = load_font(size=20, emoji=True)
-    x1, x2 = 20, frame_width - 20
-    panel_height = 118
-    y1 = frame_height - panel_height - 20
+    title_font = load_font(size=18)
+    body_font = load_font(size=14)
+    emoji_font = load_font(size=14, emoji=True)
+    panel_width = 230
+    x2 = frame_width - 20
+    x1 = max(20, x2 - panel_width)
+    y1 = 120
     y2 = frame_height - 20
     draw.rounded_rectangle((x1, y1, x2, y2), radius=18, fill=(18, 18, 18, 220))
 
-    draw.text((x1 + 16, y1 + 12), "SENTI", font=title_font, fill=(255, 255, 255))
-    draw.text((x1 + 16, y1 + 46), f"Emocao do video: {video_emotion}", font=emoji_font, fill=(240, 240, 240))
+    current_y = y1 + 14
+    draw.text((x1 + 14, current_y), "SENTI", font=title_font, fill=(255, 255, 255))
+    current_y += 28
+    draw.text((x1 + 14, current_y), "Emocao do video", font=body_font, fill=(210, 210, 210))
+    current_y += 20
+    emotion_lines = wrap_text_to_width(draw, video_emotion, emoji_font, panel_width - 28, 2)
+    for line in emotion_lines:
+        draw.text((x1 + 14, current_y), line, font=emoji_font, fill=(240, 240, 240))
+        current_y += 18
 
-    chip_y = y1 + 78
+    current_y += 6
     chips = [
         ("Video", video_sentiment, SENTIMENT_COLORS.get(video_sentiment, (120, 120, 120))),
-        ("Audio", audio_sentiment, SENTIMENT_COLORS.get(audio_sentiment, (120, 120, 120))),
+        ("Texto", text_sentiment, SENTIMENT_COLORS.get(text_sentiment, (120, 120, 120))),
+        ("Voz", voice_emotion, voice_color),
         ("Status", audio_status, (120, 90, 50) if "ativo" in audio_status.lower() else (120, 120, 120)),
     ]
 
-    chip_x = x1 + 16
     for prefix, value, color in chips:
         text = f"{prefix}: {value}"
-        bbox = draw.textbbox((0, 0), text, font=body_font)
-        chip_width = (bbox[2] - bbox[0]) + 24
-        chip_box = (chip_x, chip_y, chip_x + chip_width, chip_y + 32)
-        draw.rounded_rectangle(chip_box, radius=12, fill=(*color, 205))
-        draw.text((chip_x + 12, chip_y + 5), text, font=body_font, fill=(255, 255, 255))
-        chip_x += chip_width + 12
+        chip_box = (x1 + 14, current_y, x2 - 14, current_y + 30)
+        draw.rounded_rectangle(chip_box, radius=10, fill=(*color, 205))
+        draw.text((x1 + 24, current_y + 7), text, font=body_font, fill=(255, 255, 255))
+        current_y += 38
 
 
 def annotate_frame(
@@ -526,7 +772,9 @@ def annotate_frame(
         frame_height,
         video_emotion=video_emotion,
         video_sentiment=video_sentiment,
-        audio_sentiment=audio_state.sentiment_label,
+        text_sentiment=audio_state.sentiment_label,
+        voice_emotion=audio_state.voice_emotion_label,
+        voice_color=audio_state.voice_emotion_color,
         audio_status=audio_state.status,
     )
 
