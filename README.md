@@ -12,7 +12,7 @@ No estado atual, o prototipo combina:
 
 - emocao facial por video
 - transcricao local do audio
-- sentimento heuristico do texto transcrito
+- sentimento do texto transcrito com modelo Transformer em portugues
 
 ## Edge
 
@@ -46,8 +46,15 @@ O fluxo principal do prototipo multimodal funciona assim:
 3. o recorte facial em escala de cinza eh enviado para o modelo MiniXception
 4. o microfone captura audio em streaming
 5. o Vosk transcreve a fala localmente em portugues
-6. uma heuristica leve classifica o sentimento do texto transcrito
+6. o modelo `SYAS1-PTBR` classifica o sentimento do texto transcrito
 7. o video exibe a emocao facial, o sentimento do video, a transcricao e o sentimento do audio
+
+Para manter a interface responsiva:
+
+- a emocao facial eh inferida de forma assincrona, em thread separada
+- a emocao visual nao eh recalculada em todo frame
+- o sentimento do audio usa janela deslizante maxima de 100 palavras
+- a reavaliacao parcial do sentimento do audio acontece por progresso textual, e nao a cada mudanca curta de transcricao
 
 ## Componentes
 
@@ -78,9 +85,15 @@ O script tambem deriva um sentimento simplificado para o video:
 
 - `sounddevice`: captura de audio do microfone
 - `Vosk`: transcricao offline em streaming
-- heuristica textual: sentimento leve sobre o texto reconhecido
+- `SYAS1-PTBR`: sentimento textual em portugues com `transformers`
 
-O sentimento atual do audio eh uma primeira versao heuristica, pensada para baixo custo computacional. Ele deve ser tratado como baseline de edge, nao como classificador final.
+O sentimento atual do audio usa inferencia local com Transformer. O modelo eh baixado automaticamente para `models/SYAS1-PTBR/` na primeira execucao, caso ainda nao exista localmente.
+
+Regras atuais para sentimento do audio:
+
+- a analise parcial so comeca quando existem pelo menos 8 palavras no buffer
+- depois da primeira analise, uma nova reavaliacao parcial acontece a cada 5 palavras novas
+- apenas as 100 palavras mais recentes sao enviadas ao modelo de sentimento
 
 ## Estrutura
 
@@ -89,6 +102,7 @@ O sentimento atual do audio eh uma primeira versao heuristica, pensada para baix
 - `models/blaze_face_short_range.tflite`: detector de rosto usado pelo MediaPipe
 - `models/fer2013_mini_XCEPTION.102-0.66.hdf5`: modelo de emocao facial
 - `models/vosk-model-small-pt-0.3/`: modelo pequeno de ASR em portugues para o Vosk
+- `models/SYAS1-PTBR/`: modelo de sentimento textual em portugues
 - `requirements.txt`: dependencias diretas do projeto
 
 ## Requisitos
@@ -138,5 +152,7 @@ Para sair da janela do video, pressione `q`.
 
 - o script usa `MediaPipe Tasks`, nao a API antiga `mp.solutions`
 - o Vosk foi escolhido nesta fase por ser offline, leve e orientado a streaming
+- o sentimento textual do audio usa `SYAS1-PTBR` via `transformers`
+- as inferencias mais pesadas foram desacopladas para reduzir travamentos da interface
 - o overlay do texto usa fontes do Windows para texto e emoji
 - o estado atual eh de desenvolvimento local com intencao edge, nao de deploy final em dispositivo offline

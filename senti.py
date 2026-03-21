@@ -5,25 +5,40 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 import queue
-import re
 import threading
 import time
-import unicodedata
 
 import cv2
+from huggingface_hub import snapshot_download
 import mediapipe as mp
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import sounddevice as sd
+import tensorflow as tf
+import torch
 from tensorflow.keras.models import load_model
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from vosk import KaldiRecognizer, Model
 
 
 FACE_MODEL_PATH = Path("models/blaze_face_short_range.tflite")
 EMOTION_MODEL_PATH = Path("models/fer2013_mini_XCEPTION.102-0.66.hdf5")
 ASR_MODEL_PATH = Path("models/vosk-model-small-pt-0.3")
+TEXT_SENTIMENT_MODEL_PATH = Path("models/SYAS1-PTBR")
+TEXT_SENTIMENT_MODEL_ID = "manushya-ai/SYAS1-PTBR"
 EMOJI_FONT_PATH = Path(r"C:\Windows\Fonts\seguiemj.ttf")
 UI_FONT_PATH = Path(r"C:\Windows\Fonts\segoeui.ttf")
+EMOTION_INFERENCE_EVERY_N_FRAMES = 8
+FACE_DETECTION_SCALE = 0.5
+EMOTION_INFERENCE_MIN_INTERVAL_S = 1.0
+AUDIO_SENTIMENT_PARTIAL_MIN_WORDS = 8
+AUDIO_SENTIMENT_PARTIAL_WORD_STEP = 5
+AUDIO_SENTIMENT_MAX_WORDS = 100
+
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(1)
+
+MODEL_INFERENCE_LOCK = threading.Lock()
 
 # MiniXception treinado no dataset FER-2013.
 EMOTION_LABELS = {
@@ -63,54 +78,6 @@ SENTIMENT_COLORS = {
     "Indisponivel": (120, 120, 120),
 }
 
-POSITIVE_HINTS = {
-    "adorei": 3,
-    "adoro": 3,
-    "amei": 3,
-    "amo": 3,
-    "bom": 1,
-    "boa": 1,
-    "excelente": 2,
-    "feliz": 2,
-    "gostei": 2,
-    "gostei muito": 3,
-    "legal": 1,
-    "maravilhoso": 2,
-    "maravilhosa": 2,
-    "muito bom": 2,
-    "muito boa": 2,
-    "otimo": 2,
-    "otima": 2,
-    "perfeito": 2,
-    "perfeita": 2,
-    "satisfeito": 2,
-    "satisfeita": 2,
-}
-
-NEGATIVE_HINTS = {
-    "demorado": 1,
-    "demora": 1,
-    "detestei": 3,
-    "detesto": 3,
-    "horrivel": 2,
-    "insatisfeito": 2,
-    "insatisfeita": 2,
-    "lento": 1,
-    "medo": 1,
-    "nao gostei": 3,
-    "nojo": 2,
-    "odeiei": 3,
-    "odeio": 3,
-    "odiei": 3,
-    "pessimo": 2,
-    "pessima": 2,
-    "problema": 1,
-    "raiva": 2,
-    "ruim": 2,
-    "terrivel": 2,
-    "triste": 2,
-}
-
 
 @dataclass
 class AudioState:
@@ -120,9 +87,48 @@ class AudioState:
     status: str = "Audio nao iniciado"
 
 
+@dataclass
+class EmotionState:
+    emotion_label: str = "Sem emocao"
+    video_sentiment: str = "Indisponivel"
+    color: tuple[int, int, int] = SENTIMENT_COLORS["Indisponivel"]
+
+
+class TextSentimentAnalyzer:
+    def __init__(self, model_dir: Path) -> None:
+        self.model_dir = model_dir
+        self.device = torch.device("cpu")
+        torch.set_num_threads(1)
+        self.tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+        self.model = AutoModelForSequenceClassification.from_pretrained(str(model_dir))
+        self.model.eval()
+        self.model.to(self.device)
+
+    def predict(self, text: str) -> tuple[str, tuple[int, int, int]]:
+        if not text.strip():
+            return "Indisponivel", SENTIMENT_COLORS["Indisponivel"]
+
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=256,
+        )
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+
+        with MODEL_INFERENCE_LOCK:
+            with torch.no_grad():
+                logits = self.model(**inputs).logits
+                prediction = int(torch.argmax(logits, dim=1).item())
+
+        label = self.model.config.id2label[prediction]
+        return label, SENTIMENT_COLORS.get(label, SENTIMENT_COLORS["Neutro"])
+
+
 class AudioTranscriber:
-    def __init__(self, model_path: Path) -> None:
+    def __init__(self, model_path: Path, sentiment_analyzer: TextSentimentAnalyzer) -> None:
         self.model_path = model_path
+        self.sentiment_analyzer = sentiment_analyzer
         self.audio_queue: queue.Queue[bytes] = queue.Queue()
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
@@ -134,6 +140,8 @@ class AudioTranscriber:
         self.recognizer: KaldiRecognizer | None = None
         self.model: Model | None = None
         self.sample_rate = 16000
+        self.last_classified_text = ""
+        self.last_classified_word_count = 0
 
     def start(self) -> None:
         if not self.model_path.exists():
@@ -195,12 +203,14 @@ class AudioTranscriber:
             except queue.Empty:
                 continue
 
+            is_final_result = False
             if self.recognizer.AcceptWaveform(data):
                 result = json.loads(self.recognizer.Result())
                 transcript = result.get("text", "").strip()
                 if transcript:
                     self.final_segments.append(transcript)
                 self.partial_text = ""
+                is_final_result = True
             else:
                 partial = json.loads(self.recognizer.PartialResult())
                 self.partial_text = partial.get("partial", "").strip()
@@ -209,7 +219,26 @@ class AudioTranscriber:
             if self.partial_text:
                 combined_text = f"{combined_text} {self.partial_text}".strip()
 
-            sentiment_label, sentiment_color = classify_text_sentiment(combined_text)
+            analysis_text = limit_text_to_last_words(combined_text, AUDIO_SENTIMENT_MAX_WORDS)
+            current_word_count = len(analysis_text.split())
+            should_classify_partial = (
+                bool(self.partial_text)
+                and current_word_count >= AUDIO_SENTIMENT_PARTIAL_MIN_WORDS
+                and (current_word_count - self.last_classified_word_count) >= AUDIO_SENTIMENT_PARTIAL_WORD_STEP
+            )
+            should_classify = (
+                analysis_text != self.last_classified_text
+                and (is_final_result or should_classify_partial)
+            )
+
+            if should_classify:
+                sentiment_label, sentiment_color = self.sentiment_analyzer.predict(analysis_text)
+                self.last_classified_text = analysis_text
+                self.last_classified_word_count = current_word_count
+            else:
+                with self.state_lock:
+                    sentiment_label = self.state.sentiment_label
+                    sentiment_color = self.state.sentiment_color
             display_text = combined_text if combined_text else "Aguardando audio..."
 
             with self.state_lock:
@@ -218,33 +247,69 @@ class AudioTranscriber:
                 self.state.sentiment_color = sentiment_color
 
 
-def normalize_text(text: str) -> str:
-    normalized = unicodedata.normalize("NFKD", text)
-    normalized = normalized.encode("ascii", "ignore").decode("ascii")
-    return normalized.lower().strip()
+def limit_text_to_last_words(text: str, max_words: int) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return text.strip()
+    return " ".join(words[-max_words:]).strip()
 
 
-def classify_text_sentiment(text: str) -> tuple[str, tuple[int, int, int]]:
-    normalized_text = normalize_text(text)
-    if not normalized_text:
-        return "Indisponivel", SENTIMENT_COLORS["Indisponivel"]
+class EmotionClassifierWorker:
+    def __init__(self, model_path: Path) -> None:
+        self.model_path = model_path
+        self.stop_event = threading.Event()
+        self.state_lock = threading.Lock()
+        self.latest_state = EmotionState()
+        self.input_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1)
+        self.worker_thread = threading.Thread(target=self._run, daemon=True)
+        self.model = load_model(model_path, compile=False)
+        self.input_size = tuple(self.model.input_shape[1:3])
 
-    def score_hints(hints: dict[str, int]) -> int:
-        score = 0
-        for hint, weight in hints.items():
-            pattern = rf"(?<!\w){re.escape(hint)}(?!\w)"
-            matches = re.findall(pattern, normalized_text)
-            score += len(matches) * weight
-        return score
+    def start(self) -> None:
+        self.worker_thread.start()
 
-    positive_score = score_hints(POSITIVE_HINTS)
-    negative_score = score_hints(NEGATIVE_HINTS)
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=1.0)
 
-    if positive_score > negative_score:
-        return "Positivo", SENTIMENT_COLORS["Positivo"]
-    if negative_score > positive_score:
-        return "Negativo", SENTIMENT_COLORS["Negativo"]
-    return "Neutro", SENTIMENT_COLORS["Neutro"]
+    def submit(self, gray_face: np.ndarray) -> None:
+        face_copy = gray_face.copy()
+        try:
+            self.input_queue.put_nowait(face_copy)
+        except queue.Full:
+            try:
+                _ = self.input_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self.input_queue.put_nowait(face_copy)
+
+    def get_state(self) -> EmotionState:
+        with self.state_lock:
+            return EmotionState(
+                emotion_label=self.latest_state.emotion_label,
+                video_sentiment=self.latest_state.video_sentiment,
+                color=self.latest_state.color,
+            )
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                gray_face = self.input_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            face_tensor = preprocess_face(gray_face, self.input_size)
+            with MODEL_INFERENCE_LOCK:
+                emotion_scores = self.model.predict(face_tensor, verbose=0)[0]
+            emotion_index = int(np.argmax(emotion_scores))
+
+            with self.state_lock:
+                self.latest_state = EmotionState(
+                    emotion_label=EMOTION_LABELS[emotion_index],
+                    video_sentiment=VIDEO_SENTIMENTS[emotion_index],
+                    color=EMOTION_COLORS[emotion_index],
+                )
 
 
 def preprocess_face(gray_face: np.ndarray, input_size: tuple[int, int]) -> np.ndarray:
@@ -265,6 +330,21 @@ def clamp_bbox(
     x2 = min(frame_width, x1 + int(bbox.width))
     y2 = min(frame_height, y1 + int(bbox.height))
     return x1, y1, x2, y2
+
+
+def scale_bbox(
+    bbox: tuple[int, int, int, int],
+    scale_x: float,
+    scale_y: float,
+    frame_width: int,
+    frame_height: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
+    scaled_x1 = max(0, min(frame_width, int(x1 * scale_x)))
+    scaled_y1 = max(0, min(frame_height, int(y1 * scale_y)))
+    scaled_x2 = max(0, min(frame_width, int(x2 * scale_x)))
+    scaled_y2 = max(0, min(frame_height, int(y2 * scale_y)))
+    return scaled_x1, scaled_y1, scaled_x2, scaled_y2
 
 
 def load_font(size: int, emoji: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -464,8 +544,20 @@ def validate_assets() -> None:
         raise FileNotFoundError(f"Arquivos obrigatorios ausentes: {', '.join(missing)}")
 
 
+def ensure_text_sentiment_model() -> Path:
+    if TEXT_SENTIMENT_MODEL_PATH.exists():
+        return TEXT_SENTIMENT_MODEL_PATH
+
+    snapshot_download(
+        repo_id=TEXT_SENTIMENT_MODEL_ID,
+        local_dir=str(TEXT_SENTIMENT_MODEL_PATH),
+    )
+    return TEXT_SENTIMENT_MODEL_PATH
+
+
 def main() -> None:
     validate_assets()
+    text_sentiment_model_path = ensure_text_sentiment_model()
 
     base_options = mp.tasks.BaseOptions(model_asset_path=str(FACE_MODEL_PATH))
     face_options = mp.tasks.vision.FaceDetectorOptions(
@@ -474,14 +566,18 @@ def main() -> None:
         min_detection_confidence=0.5,
     )
 
-    emotion_classifier = load_model(EMOTION_MODEL_PATH, compile=False)
-    emotion_input_size = tuple(emotion_classifier.input_shape[1:3])
+    text_sentiment_analyzer = TextSentimentAnalyzer(text_sentiment_model_path)
+    emotion_worker = EmotionClassifierWorker(EMOTION_MODEL_PATH)
+    emotion_worker.start()
 
-    audio_transcriber = AudioTranscriber(ASR_MODEL_PATH)
+    audio_transcriber = AudioTranscriber(ASR_MODEL_PATH, text_sentiment_analyzer)
     audio_transcriber.start()
+    frame_index = 0
+    last_face_submit_time = 0.0
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
+        emotion_worker.stop()
         audio_transcriber.stop()
         raise RuntimeError("Nao foi possivel abrir a camera 0.")
 
@@ -493,18 +589,32 @@ def main() -> None:
                     print("Falha ao ler frame da camera.")
                     break
 
+                frame_height, frame_width = frame.shape[:2]
+                processing_width = max(1, int(frame_width * FACE_DETECTION_SCALE))
+                processing_height = max(1, int(frame_height * FACE_DETECTION_SCALE))
+                processing_frame = cv2.resize(frame, (processing_width, processing_height))
+
                 gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                rgb_processing_frame = cv2.cvtColor(processing_frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(
+                    image_format=mp.ImageFormat.SRGB,
+                    data=rgb_processing_frame,
+                )
                 timestamp_ms = int(time.monotonic() * 1000)
                 detection_result = detector.detect_for_video(mp_image, timestamp_ms)
-
-                frame_height, frame_width = frame.shape[:2]
                 face_annotations: list[dict[str, object]] = []
+                frame_index += 1
 
                 for detection in detection_result.detections:
-                    x1, y1, x2, y2 = clamp_bbox(
+                    scaled_bbox = clamp_bbox(
                         detection.bounding_box,
+                        frame_width=processing_width,
+                        frame_height=processing_height,
+                    )
+                    x1, y1, x2, y2 = scale_bbox(
+                        scaled_bbox,
+                        scale_x=frame_width / processing_width,
+                        scale_y=frame_height / processing_height,
                         frame_width=frame_width,
                         frame_height=frame_height,
                     )
@@ -515,16 +625,22 @@ def main() -> None:
                     if gray_face.size == 0:
                         continue
 
-                    face_tensor = preprocess_face(gray_face, emotion_input_size)
-                    emotion_scores = emotion_classifier.predict(face_tensor, verbose=0)[0]
-                    emotion_index = int(np.argmax(emotion_scores))
+                    current_emotion_state = emotion_worker.get_state()
+                    should_run_emotion = (
+                        frame_index % EMOTION_INFERENCE_EVERY_N_FRAMES == 0
+                        and (time.monotonic() - last_face_submit_time) >= EMOTION_INFERENCE_MIN_INTERVAL_S
+                    )
+
+                    if should_run_emotion:
+                        emotion_worker.submit(gray_face)
+                        last_face_submit_time = time.monotonic()
 
                     face_annotations.append(
                         {
                             "bbox": (x1, y1, x2, y2),
-                            "emotion_label": EMOTION_LABELS[emotion_index],
-                            "video_sentiment": VIDEO_SENTIMENTS[emotion_index],
-                            "color": EMOTION_COLORS[emotion_index],
+                            "emotion_label": current_emotion_state.emotion_label,
+                            "video_sentiment": current_emotion_state.video_sentiment,
+                            "color": current_emotion_state.color,
                         }
                     )
 
@@ -536,6 +652,7 @@ def main() -> None:
         finally:
             cap.release()
             cv2.destroyAllWindows()
+            emotion_worker.stop()
             audio_transcriber.stop()
 
 
