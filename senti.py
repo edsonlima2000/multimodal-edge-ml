@@ -84,6 +84,23 @@ SENTIMENT_COLORS = {
     "Indisponivel": (120, 120, 120),
 }
 
+FUSION_WEIGHTS = {
+    "video": 0.55,
+    "voice": 0.38,
+    "text": 0.07,
+}
+
+VOICE_SENTIMENTS = {
+    "Alegria": "Positivo",
+    "Tristeza": "Negativo",
+    "Raiva": "Negativo",
+    "Medo": "Negativo",
+    "Surpresa": "Neutro",
+    "Nojo": "Negativo",
+    "Neutra": "Neutro",
+    "Indisponivel": "Indisponivel",
+}
+
 VOICE_EMOTION_COLORS = {
     "Alegria": (0, 190, 255),
     "Tristeza": (220, 120, 60),
@@ -101,8 +118,10 @@ class AudioState:
     text: str = "Aguardando audio..."
     sentiment_label: str = "Indisponivel"
     sentiment_color: tuple[int, int, int] = SENTIMENT_COLORS["Indisponivel"]
+    sentiment_confidence: float = 0.0
     voice_emotion_label: str = "Indisponivel"
     voice_emotion_color: tuple[int, int, int] = VOICE_EMOTION_COLORS["Indisponivel"]
+    voice_emotion_confidence: float = 0.0
     status: str = "Audio nao iniciado"
 
 
@@ -111,6 +130,7 @@ class EmotionState:
     emotion_label: str = "Sem emocao"
     video_sentiment: str = "Indisponivel"
     color: tuple[int, int, int] = SENTIMENT_COLORS["Indisponivel"]
+    confidence: float = 0.0
 
 
 class TextSentimentAnalyzer:
@@ -123,9 +143,9 @@ class TextSentimentAnalyzer:
         self.model.eval()
         self.model.to(self.device)
 
-    def predict(self, text: str) -> tuple[str, tuple[int, int, int]]:
+    def predict(self, text: str) -> tuple[str, tuple[int, int, int], float]:
         if not text.strip():
-            return "Indisponivel", SENTIMENT_COLORS["Indisponivel"]
+            return "Indisponivel", SENTIMENT_COLORS["Indisponivel"], 0.0
 
         inputs = self.tokenizer(
             text,
@@ -138,10 +158,12 @@ class TextSentimentAnalyzer:
         with MODEL_INFERENCE_LOCK:
             with torch.no_grad():
                 logits = self.model(**inputs).logits
-                prediction = int(torch.argmax(logits, dim=1).item())
+                probabilities = torch.softmax(logits, dim=1)
+                prediction = int(torch.argmax(probabilities, dim=1).item())
+                confidence = float(probabilities[0, prediction].item())
 
         label = self.model.config.id2label[prediction]
-        return label, SENTIMENT_COLORS.get(label, SENTIMENT_COLORS["Neutro"])
+        return label, SENTIMENT_COLORS.get(label, SENTIMENT_COLORS["Neutro"]), confidence
 
 
 class VoiceEmotionAnalyzer:
@@ -152,20 +174,20 @@ class VoiceEmotionAnalyzer:
         )
         self.history: deque[dict[str, float]] = deque(maxlen=VOICE_BASELINE_HISTORY)
 
-    def predict(self, audio_signal: np.ndarray, sample_rate: int) -> tuple[str, tuple[int, int, int]]:
+    def predict(self, audio_signal: np.ndarray, sample_rate: int) -> tuple[str, tuple[int, int, int], float]:
         metrics = self._extract_metrics(audio_signal, sample_rate)
         if metrics is None:
-            return "Indisponivel", VOICE_EMOTION_COLORS["Indisponivel"]
+            return "Indisponivel", VOICE_EMOTION_COLORS["Indisponivel"], 0.0
 
         if len(self.history) < VOICE_BASELINE_MIN_WINDOWS:
             self.history.append(metrics)
-            return "Indisponivel", VOICE_EMOTION_COLORS["Indisponivel"]
+            return "Indisponivel", VOICE_EMOTION_COLORS["Indisponivel"], 0.0
 
         z = self._compute_zscores(metrics)
         emotion_scores = self._score_emotions(z)
-        emotion_label = self._select_emotion(emotion_scores, z)
+        emotion_label, confidence = self._select_emotion(emotion_scores, z)
         self.history.append(metrics)
-        return emotion_label, VOICE_EMOTION_COLORS.get(emotion_label, VOICE_EMOTION_COLORS["Neutra"])
+        return emotion_label, VOICE_EMOTION_COLORS.get(emotion_label, VOICE_EMOTION_COLORS["Neutra"]), confidence
 
     def _extract_metrics(self, audio_signal: np.ndarray, sample_rate: int) -> dict[str, float] | None:
         signal = audio_signal.astype("float32")
@@ -241,20 +263,24 @@ class VoiceEmotionAnalyzer:
             ),
         }
 
-    def _select_emotion(self, emotion_scores: dict[str, float], z: dict[str, float]) -> str:
+    def _select_emotion(self, emotion_scores: dict[str, float], z: dict[str, float]) -> tuple[str, float]:
         max_abs_deviation = max(abs(value) for value in z.values())
         best_emotion = max(emotion_scores, key=emotion_scores.get)
         best_score = emotion_scores[best_emotion]
         ranked_scores = sorted(emotion_scores.values(), reverse=True)
         score_margin = ranked_scores[0] - ranked_scores[1] if len(ranked_scores) > 1 else ranked_scores[0]
+        normalized_deviation = min(max_abs_deviation / 2.5, 1.0)
+        normalized_score = min(best_score / 2.5, 1.0)
+        normalized_margin = min(score_margin / 1.5, 1.0)
+        confidence = max(0.0, min(1.0, 0.45 * normalized_score + 0.35 * normalized_margin + 0.20 * normalized_deviation))
 
         if max_abs_deviation < 0.65:
-            return "Neutra"
+            return "Neutra", max(0.0, min(1.0, 1.0 - (max_abs_deviation / 0.65)))
         if best_score < 1.2 or score_margin < 0.35:
-            return "Indisponivel"
+            return "Indisponivel", 0.0
         if best_emotion in {"Nojo", "Raiva"} and best_score < 1.45:
-            return "Neutra"
-        return best_emotion
+            return "Neutra", confidence * 0.5
+        return best_emotion, confidence
 
 
 class VoiceEmotionWorker:
@@ -264,6 +290,7 @@ class VoiceEmotionWorker:
         self.state_lock = threading.Lock()
         self.latest_label = "Indisponivel"
         self.latest_color = VOICE_EMOTION_COLORS["Indisponivel"]
+        self.latest_confidence = 0.0
         self.input_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1)
         self.analyzer = VoiceEmotionAnalyzer()
         self.worker_thread = threading.Thread(target=self._run, daemon=True)
@@ -287,9 +314,9 @@ class VoiceEmotionWorker:
                 pass
             self.input_queue.put_nowait(signal_copy)
 
-    def get_state(self) -> tuple[str, tuple[int, int, int]]:
+    def get_state(self) -> tuple[str, tuple[int, int, int], float]:
         with self.state_lock:
-            return self.latest_label, self.latest_color
+            return self.latest_label, self.latest_color, self.latest_confidence
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -298,10 +325,11 @@ class VoiceEmotionWorker:
             except queue.Empty:
                 continue
 
-            label, color = self.analyzer.predict(audio_signal, self.sample_rate)
+            label, color, confidence = self.analyzer.predict(audio_signal, self.sample_rate)
             with self.state_lock:
                 self.latest_label = label
                 self.latest_color = color
+                self.latest_confidence = confidence
 
 
 class AudioTranscriber:
@@ -372,8 +400,10 @@ class AudioTranscriber:
                 text=self.state.text,
                 sentiment_label=self.state.sentiment_label,
                 sentiment_color=self.state.sentiment_color,
+                sentiment_confidence=self.state.sentiment_confidence,
                 voice_emotion_label=self.state.voice_emotion_label,
                 voice_emotion_color=self.state.voice_emotion_color,
+                voice_emotion_confidence=self.state.voice_emotion_confidence,
                 status=self.state.status,
             )
 
@@ -425,23 +455,26 @@ class AudioTranscriber:
             )
 
             if should_classify:
-                sentiment_label, sentiment_color = self.sentiment_analyzer.predict(analysis_text)
+                sentiment_label, sentiment_color, sentiment_confidence = self.sentiment_analyzer.predict(analysis_text)
                 self.last_classified_text = analysis_text
                 self.last_classified_word_count = current_word_count
             else:
                 with self.state_lock:
                     sentiment_label = self.state.sentiment_label
                     sentiment_color = self.state.sentiment_color
+                    sentiment_confidence = self.state.sentiment_confidence
             display_text = combined_text if combined_text else "Aguardando audio..."
 
             with self.state_lock:
                 self.state.text = display_text
                 self.state.sentiment_label = sentiment_label
                 self.state.sentiment_color = sentiment_color
+                self.state.sentiment_confidence = sentiment_confidence
                 if self.voice_worker is not None:
-                    voice_label, voice_color = self.voice_worker.get_state()
+                    voice_label, voice_color, voice_confidence = self.voice_worker.get_state()
                     self.state.voice_emotion_label = voice_label
                     self.state.voice_emotion_color = voice_color
+                    self.state.voice_emotion_confidence = voice_confidence
 
     def _update_voice_buffer(self, audio_chunk: np.ndarray) -> None:
         if audio_chunk.size == 0:
@@ -492,6 +525,62 @@ def limit_text_to_last_words(text: str, max_words: int) -> str:
     return " ".join(words[-max_words:]).strip()
 
 
+def clamp_confidence(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def format_with_confidence(label: str, confidence: float) -> str:
+    if label == "Indisponivel":
+        return label
+    return f"{label} [{round(clamp_confidence(confidence) * 100)}%]"
+
+
+def sentiment_to_class(label: str) -> str | None:
+    if label == "Positivo":
+        return "Positivo"
+    if label == "Negativo":
+        return "Negativo"
+    if label == "Neutro":
+        return "Neutro"
+    return None
+
+
+def fuse_multimodal_sentiment(
+    video_sentiment: str,
+    video_confidence: float,
+    text_sentiment: str,
+    text_confidence: float,
+    voice_emotion: str,
+    voice_confidence: float,
+) -> tuple[str, float]:
+    modal_votes = {
+        "video": (sentiment_to_class(video_sentiment), clamp_confidence(video_confidence)),
+        "text": (sentiment_to_class(text_sentiment), clamp_confidence(text_confidence)),
+        "voice": (sentiment_to_class(VOICE_SENTIMENTS.get(voice_emotion, "Indisponivel")), clamp_confidence(voice_confidence)),
+    }
+
+    class_scores = {
+        "Positivo": 0.0,
+        "Negativo": 0.0,
+        "Neutro": 0.0,
+    }
+
+    total_vote_mass = 0.0
+    for modal_name, (sentiment_class, confidence) in modal_votes.items():
+        if sentiment_class is None or confidence <= 0:
+            continue
+        weighted_confidence = FUSION_WEIGHTS[modal_name] * confidence
+        class_scores[sentiment_class] += weighted_confidence
+        total_vote_mass += weighted_confidence
+
+    if total_vote_mass <= 0:
+        return "Indisponivel", 0.0
+
+    final_label = max(class_scores, key=class_scores.get)
+    final_confidence = class_scores[final_label] / total_vote_mass
+    return final_label, final_confidence
+
+
 class EmotionClassifierWorker:
     def __init__(self, model_path: Path) -> None:
         self.model_path = model_path
@@ -528,6 +617,7 @@ class EmotionClassifierWorker:
                 emotion_label=self.latest_state.emotion_label,
                 video_sentiment=self.latest_state.video_sentiment,
                 color=self.latest_state.color,
+                confidence=self.latest_state.confidence,
             )
 
     def _run(self) -> None:
@@ -541,12 +631,14 @@ class EmotionClassifierWorker:
             with MODEL_INFERENCE_LOCK:
                 emotion_scores = self.model.predict(face_tensor, verbose=0)[0]
             emotion_index = int(np.argmax(emotion_scores))
+            emotion_confidence = float(emotion_scores[emotion_index])
 
             with self.state_lock:
                 self.latest_state = EmotionState(
                     emotion_label=EMOTION_LABELS[emotion_index],
                     video_sentiment=VIDEO_SENTIMENTS[emotion_index],
                     color=EMOTION_COLORS[emotion_index],
+                    confidence=emotion_confidence,
                 )
 
 
@@ -693,9 +785,14 @@ def draw_bottom_dashboard(
     frame_height: int,
     video_emotion: str,
     video_sentiment: str,
+    video_confidence: float,
     text_sentiment: str,
+    text_confidence: float,
     voice_emotion: str,
+    voice_confidence: float,
     voice_color: tuple[int, int, int],
+    final_sentiment: str,
+    final_confidence: float,
     audio_status: str,
 ) -> None:
     title_font = load_font(size=18)
@@ -711,6 +808,12 @@ def draw_bottom_dashboard(
     current_y = y1 + 14
     draw.text((x1 + 14, current_y), "SENTI", font=title_font, fill=(255, 255, 255))
     current_y += 28
+    final_text = f"Final: {format_with_confidence(final_sentiment, final_confidence)}"
+    final_color = SENTIMENT_COLORS.get(final_sentiment, SENTIMENT_COLORS["Indisponivel"])
+    final_box = (x1 + 14, current_y, x2 - 14, current_y + 32)
+    draw.rounded_rectangle(final_box, radius=10, fill=(*final_color, 210))
+    draw.text((x1 + 24, current_y + 8), final_text, font=body_font, fill=(255, 255, 255))
+    current_y += 42
     draw.text((x1 + 14, current_y), "Emocao do video", font=body_font, fill=(210, 210, 210))
     current_y += 20
     emotion_lines = wrap_text_to_width(draw, video_emotion, emoji_font, panel_width - 28, 2)
@@ -720,9 +823,9 @@ def draw_bottom_dashboard(
 
     current_y += 6
     chips = [
-        ("Video", video_sentiment, SENTIMENT_COLORS.get(video_sentiment, (120, 120, 120))),
-        ("Texto", text_sentiment, SENTIMENT_COLORS.get(text_sentiment, (120, 120, 120))),
-        ("Voz", voice_emotion, voice_color),
+        ("Video", format_with_confidence(video_sentiment, video_confidence), SENTIMENT_COLORS.get(video_sentiment, (120, 120, 120))),
+        ("Texto", format_with_confidence(text_sentiment, text_confidence), SENTIMENT_COLORS.get(text_sentiment, (120, 120, 120))),
+        ("Voz", format_with_confidence(voice_emotion, voice_confidence), voice_color),
         ("Status", audio_status, (120, 90, 50) if "ativo" in audio_status.lower() else (120, 120, 120)),
     ]
 
@@ -760,9 +863,20 @@ def annotate_frame(
         primary_face = face_annotations[0]
         video_emotion = primary_face["emotion_label"]
         video_sentiment = primary_face["video_sentiment"]
+        video_confidence = float(primary_face["confidence"])
     else:
         video_emotion = "Sem rosto detectado"
         video_sentiment = "Indisponivel"
+        video_confidence = 0.0
+
+    final_sentiment, final_confidence = fuse_multimodal_sentiment(
+        video_sentiment=video_sentiment,
+        video_confidence=video_confidence,
+        text_sentiment=audio_state.sentiment_label,
+        text_confidence=audio_state.sentiment_confidence,
+        voice_emotion=audio_state.voice_emotion_label,
+        voice_confidence=audio_state.voice_emotion_confidence,
+    )
 
     frame_width, frame_height = frame.shape[1], frame.shape[0]
     draw_top_transcription_bar(draw, frame_width, audio_state.text)
@@ -772,9 +886,14 @@ def annotate_frame(
         frame_height,
         video_emotion=video_emotion,
         video_sentiment=video_sentiment,
+        video_confidence=video_confidence,
         text_sentiment=audio_state.sentiment_label,
+        text_confidence=audio_state.sentiment_confidence,
         voice_emotion=audio_state.voice_emotion_label,
+        voice_confidence=audio_state.voice_emotion_confidence,
         voice_color=audio_state.voice_emotion_color,
+        final_sentiment=final_sentiment,
+        final_confidence=final_confidence,
         audio_status=audio_state.status,
     )
 
@@ -889,6 +1008,7 @@ def main() -> None:
                             "emotion_label": current_emotion_state.emotion_label,
                             "video_sentiment": current_emotion_state.video_sentiment,
                             "color": current_emotion_state.color,
+                            "confidence": current_emotion_state.confidence,
                         }
                     )
 
