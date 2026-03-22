@@ -50,7 +50,9 @@ O fluxo principal do prototipo multimodal funciona assim:
 6. o `openSMILE` extrai medidas acustico-prosodicas do audio em janelas curtas
 7. uma heuristica baseada em `pitch/F0`, `intensidade` e `duracao/ritmo` estima a emocao da voz
 8. o modelo `SYAS1-PTBR` classifica o sentimento do texto transcrito
-9. o video exibe a emocao facial, o sentimento do video, a transcricao, o sentimento do texto e a emocao da voz
+9. a fusao multimodal calcula o sentimento final ponderado a partir de video, voz e texto
+10. o video exibe a emocao facial, o sentimento do video, a transcricao, o sentimento do texto, a emocao da voz e a leitura final multimodal
+11. o overlay inferior tambem plota uma timeline compacta de 1 minuto com a evolucao do sentimento final entre `Positivo`, `Neutro` e `Negativo`
 
 Para manter a interface responsiva:
 
@@ -59,6 +61,7 @@ Para manter a interface responsiva:
 - a emocao da voz eh inferida em thread separada a partir de janelas de audio
 - o sentimento do audio usa janela deslizante maxima de 100 palavras
 - a reavaliacao parcial do sentimento do audio acontece por progresso textual, e nao a cada mudanca curta de transcricao
+- a timeline do sentimento final usa janela movel de 60 segundos com amostragem visual compacta
 
 ## Mapa de Tecnologias
 
@@ -227,6 +230,13 @@ No painel, o projeto mostra cada resultado com confianca em percentual, por exem
 
 O resultado final exibido no dashboard e a classe multimodal derivada da fusao dos tres modais.
 
+No overlay atual:
+
+- o painel lateral direito continua mostrando o resumo por modal e o resultado final
+- a faixa inferior esquerda mostra uma timeline compacta de 60 segundos do sentimento multimodal final
+- o eixo vertical da timeline usa uma escala simplificada, com `Positivo` acima, `Neutro` no centro e `Negativo` abaixo
+- a intensidade do ponto no grafico segue a confianca da classe final vencedora em cada amostra
+
 Esta escolha segue a interpretacao de que a comunicacao afetiva depende mais da expressao e da forma do que do conteudo literal, sendo a distribuicao de pesos alinhada com a regra atribuida a Mehrabian para este tipo de leitura. A fusao aqui nao pretende ser uma verdade universal sobre linguagem, mas uma heuristica pratica para o contexto do `SENTI`.
 
 ## Estrutura
@@ -292,6 +302,8 @@ Para sair da janela do video, pressione `q`.
 - o overlay do texto usa fontes do Windows para texto e emoji
 - o estado atual eh de desenvolvimento local com intencao edge, nao de deploy final em dispositivo offline
 - a leitura multimodal final usa fusao ponderada em nivel de decisao e mostra confidencia por modal no dashboard
+- o overlay tambem mostra uma timeline historica compacta do sentimento final para leitura temporal curta da interacao
+- a curiosidade inicial sobre o uso de deteccao emocional em tempo real para contexto de varejo tambem foi estimulada pela leitura de um artigo da `IJRASET` sobre deteccao de emocao em lojas; no `SENTI`, essa referencia entrou como inspiracao de problema e contexto, nao como reproducao direta da implementacao
 
 ## Referencias
 
@@ -300,3 +312,4 @@ Para sair da janela do video, pressione `q`.
 - Jorge, Ana Cristina Aparecida. "Analise da percepcao da prosodia afetiva de pacientes com esquizofrenia". Tese de Doutorado, FFLCH-USP, 2023.
 - Mehrabian, A.; Friar, J. T. "Encoding of attitude by a seated communicator via posture and position cues". *Journal of Consulting and Clinical Psychology*, v. 33, n. 3, p. 330, 1969.
 - Franco, Roberto Yuri da Silva. "Um Modelo para Classificacao e Visualizacao Automatica de Dados de Sentimentos". Tese de Doutorado, UFPA, 2019.
+- Parihar, Pratik Singh; Pathak, Shubhangi; Shukla, Vivek. "Real Time Machine Learning Based Emotion Detection for Retail Stores to Capture Customer's Feedback Based on Their Emotion". *International Journal for Research in Applied Science & Engineering Technology (IJRASET)*, v. 13, n. 7, July 2025. DOI: `10.22214/ijraset.2025.73358`.
