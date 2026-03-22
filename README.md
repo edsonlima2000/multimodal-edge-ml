@@ -2,7 +2,7 @@
 
 Sentiment Extraction from Natural signals in real-Time for Interpretation
 
-Projeto de prototipo para NPS multimodal em tempo real, com foco em capturar sinais do sentimento do individuo durante a interacao.
+Projeto de prototipo para analise multimodal de sentimentos em tempo real, com foco em capturar sinais afetivos do individuo durante a interacao.
 
 ## Objetivo
 
@@ -303,7 +303,7 @@ Para sair da janela do video, pressione `q`.
 - o estado atual eh de desenvolvimento local com intencao edge, nao de deploy final em dispositivo offline
 - a leitura multimodal final usa fusao ponderada em nivel de decisao e mostra confidencia por modal no dashboard
 - o overlay tambem mostra uma timeline historica compacta do sentimento final para leitura temporal curta da interacao
-- a curiosidade inicial sobre o uso de deteccao emocional em tempo real para contexto de varejo tambem foi estimulada pela leitura de um artigo da `IJRASET` sobre deteccao de emocao em lojas; no `SENTI`, essa referencia entrou como inspiracao de problema e contexto, nao como reproducao direta da implementacao
+- a leitura do trabalho de Parihar, Pathak e Shukla (2025) ajudou a disparar a ideia inicial do projeto; a partir dessa referencia, o `SENTI` buscou construir um prototipo proprio com implementacao multimodal e direcao de preparo para cenarios edge, sem reproduzir diretamente a implementacao descrita no artigo
 
 ## Referencias
 
