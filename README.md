@@ -133,7 +133,7 @@ Comportamento atual da heuristica:
 - usa janela de audio de 2 segundos com atualizacao a cada 1 segundo
 - precisa de algumas janelas iniciais para formar um baseline do proprio falante
 - compara a janela atual contra esse baseline, em vez de usar limiares absolutos
-- produz uma emocao de voz separada para uso futuro na fusao multimodal do sentimento
+- produz uma emocao de voz separada que ja participa da fusao multimodal do sentimento
 - quando a evidencia acustica eh fraca ou ambigua, o sistema prefere retornar `Indisponivel` em vez de forcar uma emocao
 - `Neutra` eh usada quando o sinal existe, mas nao apresenta marcador emocional forte
 
@@ -162,6 +162,37 @@ Principais heuristicas detalhadas para o algoritmo:
 - `Raiva`: priorizar picos de intensidade. A raiva se destaca pelos maiores picos de energia vocal.
 - `Medo`: combinar baixa intensidade com alta variabilidade de `F0` e fala encurtada.
 - `Tristeza` vs `Neutra`: ambas podem ter `F0` baixo, mas `Tristeza` tende a reduzir tambem variabilidade de `F0` e intensidade geral.
+
+## Fusao Multimodal
+
+A classificacao final de sentimento passa a ser calculada em nivel de decisao com base em tres modais:
+
+- `video`: 55%
+- `voz`: 38%
+- `texto`: 7%
+
+Antes da fusao, as confiancas de cada modal sao tratadas na mesma base `0..1` e limitadas ao intervalo valido. Na pratica, a fusao usa a confianca de cada modal como massa de voto ponderada pelo seu peso.
+
+Na etapa de consolidacao:
+
+- o `video` ja fornece diretamente `Positivo`, `Negativo` ou `Neutro`
+- o `texto` ja fornece diretamente `Positivo`, `Negativo` ou `Neutro`
+- a `voz` primeiro eh convertida de emocao para classe de sentimento antes da fusao:
+  - `Alegria` -> `Positivo`
+  - `Tristeza`, `Raiva`, `Medo`, `Nojo` -> `Negativo`
+  - `Surpresa`, `Neutra` -> `Neutro`
+- modais `Indisponivel` ou com confianca zero nao entram no calculo final
+- a confianca final exibida no dashboard corresponde a participacao da classe vencedora dentro da massa total de votos disponivel
+
+No painel, o projeto mostra cada resultado com confianca em percentual, por exemplo:
+
+- `Video: Negativo [60%]`
+- `Voz: Neutra [48%]`
+- `Texto: Positivo [72%]`
+
+O resultado final exibido no dashboard e a classe multimodal derivada da fusao dos tres modais.
+
+Esta escolha segue a interpretacao de que a comunicacao afetiva depende mais da expressao e da forma do que do conteudo literal, sendo a distribuicao de pesos alinhada com a regra atribuida a Mehrabian para este tipo de leitura. A fusao aqui nao pretende ser uma verdade universal sobre linguagem, mas uma heuristica pratica para o contexto do `SENTI`.
 
 ## Estrutura
 
@@ -225,9 +256,12 @@ Para sair da janela do video, pressione `q`.
 - as inferencias mais pesadas foram desacopladas para reduzir travamentos da interface
 - o overlay do texto usa fontes do Windows para texto e emoji
 - o estado atual eh de desenvolvimento local com intencao edge, nao de deploy final em dispositivo offline
+- a leitura multimodal final usa fusao ponderada em nivel de decisao e mostra confidencia por modal no dashboard
 
 ## Referencias
 
 - Aguiar, A. C. de, Constantini, A. C., Moraes, R. M. de, & Almeida, A. A. "Medidas acustico-prosodicas discriminam as emocoes de falantes do portugues brasileiro". *CoDAS*, 2025.
 - Eyben, F., Scherer, K., Schuller, B., Sundberg, J., Andre, E., Busso, C., Devillers, L., Epps, J., Laukka, P., Narayanan, S., & Truong, K. "The Geneva Minimalistic Acoustic Parameter Set (GeMAPS) for Voice Research and Affective Computing".
 - Jorge, Ana Cristina Aparecida. "Analise da percepcao da prosodia afetiva de pacientes com esquizofrenia". Tese de Doutorado, FFLCH-USP, 2023.
+- Mehrabian, A.; Friar, J. T. "Encoding of attitude by a seated communicator via posture and position cues". *Journal of Consulting and Clinical Psychology*, v. 33, n. 3, p. 330, 1969.
+- Franco, Roberto Yuri da Silva. "Um Modelo para Classificacao e Visualizacao Automatica de Dados de Sentimentos". Tese de Doutorado, UFPA, 2019.
