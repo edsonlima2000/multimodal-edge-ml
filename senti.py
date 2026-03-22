@@ -40,6 +40,9 @@ VOICE_ANALYSIS_STEP_S = 1.0
 VOICE_BASELINE_MIN_WINDOWS = 3
 VOICE_BASELINE_HISTORY = 20
 VOICE_MIN_RMS = 0.01
+SENTIMENT_TIMELINE_WINDOW_S = 60.0
+SENTIMENT_TIMELINE_SAMPLE_STEP_S = 0.5
+BOTTOM_PANEL_HEIGHT_RATIO = 0.25
 
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)
@@ -131,6 +134,14 @@ class EmotionState:
     video_sentiment: str = "Indisponivel"
     color: tuple[int, int, int] = SENTIMENT_COLORS["Indisponivel"]
     confidence: float = 0.0
+
+
+@dataclass
+class SentimentTimelinePoint:
+    timestamp: float
+    score: float
+    label: str
+    confidence: float
 
 
 class TextSentimentAnalyzer:
@@ -581,6 +592,50 @@ def fuse_multimodal_sentiment(
     return final_label, final_confidence
 
 
+def sentiment_to_timeline_score(label: str, confidence: float) -> float:
+    clamped_confidence = clamp_confidence(confidence)
+    if label == "Positivo":
+        return clamped_confidence
+    if label == "Negativo":
+        return -clamped_confidence
+    if label == "Neutro":
+        return 0.0
+    return 0.0
+
+
+def prune_sentiment_timeline(timeline: deque[SentimentTimelinePoint], now: float) -> None:
+    while timeline and (now - timeline[0].timestamp) > SENTIMENT_TIMELINE_WINDOW_S:
+        timeline.popleft()
+
+
+def update_sentiment_timeline(
+    timeline: deque[SentimentTimelinePoint],
+    label: str,
+    confidence: float,
+    now: float,
+) -> None:
+    prune_sentiment_timeline(timeline, now)
+    if label not in {"Positivo", "Negativo", "Neutro"}:
+        return
+
+    point = SentimentTimelinePoint(
+        timestamp=now,
+        score=sentiment_to_timeline_score(label, confidence),
+        label=label,
+        confidence=clamp_confidence(confidence),
+    )
+    if timeline and (now - timeline[-1].timestamp) < SENTIMENT_TIMELINE_SAMPLE_STEP_S:
+        timeline[-1] = SentimentTimelinePoint(
+            timestamp=timeline[-1].timestamp,
+            score=point.score,
+            label=point.label,
+            confidence=point.confidence,
+        )
+    else:
+        timeline.append(point)
+    prune_sentiment_timeline(timeline, now)
+
+
 class EmotionClassifierWorker:
     def __init__(self, model_path: Path) -> None:
         self.model_path = model_path
@@ -779,6 +834,113 @@ def draw_top_transcription_bar(
         current_y += body_heights[index] + 6
 
 
+def draw_sentiment_timeline_chart(
+    draw: ImageDraw.ImageDraw,
+    chart_box: tuple[int, int, int, int],
+    timeline: deque[SentimentTimelinePoint],
+    now: float,
+) -> None:
+    title_font = load_font(size=14)
+    label_font = load_font(size=10)
+    x1, y1, x2, y2 = chart_box
+    draw.rounded_rectangle(chart_box, radius=16, fill=(24, 24, 24, 210))
+
+    title_text = "Sentimento multimodal | ultimo minuto"
+    draw.text((x1 + 12, y1 + 8), title_text, font=title_font, fill=(245, 245, 245))
+
+    plot_left = x1 + 42
+    plot_right = x2 - 14
+    plot_top = y1 + 26
+    plot_bottom = y2 - 18
+    draw.rounded_rectangle((plot_left, plot_top, plot_right, plot_bottom), radius=12, outline=(70, 70, 70, 220), width=1)
+
+    guide_levels = [
+        (1.0, "P100"),
+        (0.5, "P50"),
+        (0.0, "0"),
+        (-0.5, "N50"),
+        (-1.0, "N100"),
+    ]
+    plot_height = max(1, plot_bottom - plot_top)
+    plot_width = max(1, plot_right - plot_left)
+
+    def score_to_y(score: float) -> int:
+        normalized = (1.0 - score) / 2.0
+        return int(plot_top + normalized * plot_height)
+
+    for guide_score, guide_label in guide_levels:
+        guide_y = score_to_y(guide_score)
+        guide_color = (95, 95, 95, 225) if guide_score == 0.0 else (58, 58, 58, 200)
+        draw.line((plot_left, guide_y, plot_right, guide_y), fill=guide_color, width=2 if guide_score == 0.0 else 1)
+        draw.text((x1 + 8, guide_y - 5), guide_label, font=label_font, fill=(175, 175, 175))
+
+    quarter_step = plot_width / 4.0
+    for quarter_index in range(1, 4):
+        grid_x = int(plot_left + (quarter_step * quarter_index))
+        draw.line((grid_x, plot_top, grid_x, plot_bottom), fill=(46, 46, 46, 160), width=1)
+
+    draw.text((plot_left, plot_bottom + 3), "-60s", font=label_font, fill=(165, 165, 165))
+    now_bbox = draw.textbbox((0, 0), "agora", font=label_font)
+    draw.text((plot_right - (now_bbox[2] - now_bbox[0]), plot_bottom + 3), "agora", font=label_font, fill=(165, 165, 165))
+
+    if not timeline:
+        empty_text = "Aguardando historico suficiente para plotagem"
+        empty_bbox = draw.textbbox((0, 0), empty_text, font=label_font)
+        empty_x = plot_left + max(0, (plot_width - (empty_bbox[2] - empty_bbox[0])) // 2)
+        empty_y = plot_top + max(0, (plot_height - (empty_bbox[3] - empty_bbox[1])) // 2)
+        draw.text((empty_x, empty_y), empty_text, font=label_font, fill=(145, 145, 145))
+        return
+
+    timeline_points = [point for point in timeline if (now - point.timestamp) <= SENTIMENT_TIMELINE_WINDOW_S]
+    if len(timeline_points) == 1:
+        timeline_points = [timeline_points[0], timeline_points[0]]
+
+    polyline_points: list[tuple[int, int]] = []
+    for point in timeline_points:
+        elapsed = max(0.0, min(SENTIMENT_TIMELINE_WINDOW_S, now - point.timestamp))
+        x_position = int(plot_right - ((elapsed / SENTIMENT_TIMELINE_WINDOW_S) * plot_width))
+        polyline_points.append((x_position, score_to_y(point.score)))
+
+    for index in range(1, len(polyline_points)):
+        segment_color = SENTIMENT_COLORS.get(timeline_points[index].label, (160, 160, 160))
+        draw.line([polyline_points[index - 1], polyline_points[index]], fill=(*segment_color, 235), width=3)
+
+    latest_x, latest_y = polyline_points[-1]
+    latest_color = SENTIMENT_COLORS.get(timeline_points[-1].label, (160, 160, 160))
+    draw.ellipse((latest_x - 4, latest_y - 4, latest_x + 4, latest_y + 4), fill=(*latest_color, 255), outline=(255, 255, 255, 220))
+
+
+def get_right_dashboard_box(frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
+    panel_width = 230
+    x2 = frame_width - 20
+    x1 = max(20, x2 - panel_width)
+    y1 = 120
+    y2 = frame_height - 20
+    return x1, y1, x2, y2
+
+
+def draw_bottom_timeline_panel(
+    draw: ImageDraw.ImageDraw,
+    frame_width: int,
+    frame_height: int,
+    right_panel_x1: int,
+    timeline: deque[SentimentTimelinePoint],
+    now: float,
+) -> None:
+    chart_x1 = 20
+    chart_x2 = max(chart_x1 + 180, right_panel_x1 - 14)
+    chart_height = max(72, int(frame_height * BOTTOM_PANEL_HEIGHT_RATIO))
+    chart_height = min(chart_height, max(72, int(frame_height * 0.25)))
+    chart_y2 = frame_height - 20
+    chart_y1 = max(120, chart_y2 - chart_height)
+    draw_sentiment_timeline_chart(
+        draw,
+        chart_box=(chart_x1, chart_y1, chart_x2, chart_y2),
+        timeline=timeline,
+        now=now,
+    )
+
+
 def draw_bottom_dashboard(
     draw: ImageDraw.ImageDraw,
     frame_width: int,
@@ -798,11 +960,7 @@ def draw_bottom_dashboard(
     title_font = load_font(size=18)
     body_font = load_font(size=14)
     emoji_font = load_font(size=14, emoji=True)
-    panel_width = 230
-    x2 = frame_width - 20
-    x1 = max(20, x2 - panel_width)
-    y1 = 120
-    y2 = frame_height - 20
+    x1, y1, x2, y2 = get_right_dashboard_box(frame_width, frame_height)
     draw.rounded_rectangle((x1, y1, x2, y2), radius=18, fill=(18, 18, 18, 220))
 
     current_y = y1 + 14
@@ -816,7 +974,7 @@ def draw_bottom_dashboard(
     current_y += 42
     draw.text((x1 + 14, current_y), "Emocao do video", font=body_font, fill=(210, 210, 210))
     current_y += 20
-    emotion_lines = wrap_text_to_width(draw, video_emotion, emoji_font, panel_width - 28, 2)
+    emotion_lines = wrap_text_to_width(draw, video_emotion, emoji_font, 230 - 28, 2)
     for line in emotion_lines:
         draw.text((x1 + 14, current_y), line, font=emoji_font, fill=(240, 240, 240))
         current_y += 18
@@ -841,6 +999,7 @@ def annotate_frame(
     frame: np.ndarray,
     face_annotations: list[dict[str, object]],
     audio_state: AudioState,
+    sentiment_timeline: deque[SentimentTimelinePoint],
 ) -> np.ndarray:
     for annotation in face_annotations:
         x1, y1, x2, y2 = annotation["bbox"]
@@ -877,9 +1036,20 @@ def annotate_frame(
         voice_emotion=audio_state.voice_emotion_label,
         voice_confidence=audio_state.voice_emotion_confidence,
     )
+    now = time.monotonic()
+    update_sentiment_timeline(sentiment_timeline, final_sentiment, final_confidence, now)
 
     frame_width, frame_height = frame.shape[1], frame.shape[0]
     draw_top_transcription_bar(draw, frame_width, audio_state.text)
+    right_panel_x1, _, _, _ = get_right_dashboard_box(frame_width, frame_height)
+    draw_bottom_timeline_panel(
+        draw,
+        frame_width,
+        frame_height,
+        right_panel_x1=right_panel_x1,
+        timeline=sentiment_timeline,
+        now=now,
+    )
     draw_bottom_dashboard(
         draw,
         frame_width,
@@ -941,6 +1111,7 @@ def main() -> None:
     audio_transcriber.start()
     frame_index = 0
     last_face_submit_time = 0.0
+    sentiment_timeline: deque[SentimentTimelinePoint] = deque()
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -1012,7 +1183,7 @@ def main() -> None:
                         }
                     )
 
-                frame = annotate_frame(frame, face_annotations, audio_transcriber.get_state())
+                frame = annotate_frame(frame, face_annotations, audio_transcriber.get_state(), sentiment_timeline)
                 cv2.imshow("SENTI", frame)
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):
