@@ -11,7 +11,7 @@ O projeto busca evoluir para um pipeline multimodal em tempo real que combine si
 No estado atual, o prototipo combina:
 
 - emocao facial por video
-- transcricao local do audio
+- transcricao local do audio com ASR offline
 - sentimento do texto transcrito com modelo Transformer em portugues
 - emocao do tom de voz por heuristicas acustico-prosodicas com `openSMILE`
 
@@ -60,14 +60,41 @@ Para manter a interface responsiva:
 - o sentimento do audio usa janela deslizante maxima de 100 palavras
 - a reavaliacao parcial do sentimento do audio acontece por progresso textual, e nao a cada mudanca curta de transcricao
 
+## Mapa de Tecnologias
+
+O prototipo mistura componentes de ML, componentes nao neurais e bibliotecas de suporte. Em termos praticos:
+
+- `MediaPipe Face Detector`: detector facial de visao computacional com modelo pronto em `TFLite`; eh ML para deteccao, mas nao eh modelo de linguagem
+- `MiniXception`: rede neural convolucional (`CNN`) para classificar emocao facial; eh o principal bloco de visao afetiva do projeto
+- `Vosk`: motor de `ASR` offline para transcricao em streaming; nao eh `LLM` nem modelo generativo, e no projeto entra como reconhecedor local de fala
+- `SYAS1-PTBR`: classificador de sentimento textual baseado em `Transformer` via `transformers`; eh NLP supervisionado para classificacao, nao um chatbot generativo
+- `openSMILE`: extrator de features acustico-prosodicas; nao eh `LLM`, nao eh classificador final e nao gera texto
+- heuristica de voz em `senti.py`: camada de decisao baseada em regras, `z-score` e baseline do proprio falante; nao eh modelo treinado de classificacao
+- `OpenCV`, `sounddevice`, `Pillow`, `threading` e `queue`: infraestrutura de captura, UI e orquestracao; nao sao componentes de ML
+
+Separando por natureza tecnica:
+
+- `ML de visao`: `MediaPipe Face Detector`, `MiniXception`
+- `ML/NLP`: `SYAS1-PTBR` com `Transformer`
+- `ASR offline`: `Vosk`
+- `DSP / audio features`: `openSMILE`
+- `logica simbolica / heuristica`: classificacao da emocao da voz a partir das features extraidas
+- `infraestrutura nao-ML`: captura de webcam/microfone, overlay e execucao assincrona
+
 ## Componentes
 
 ### Video
 
-- `MediaPipe Face Detector`: deteccao facial em tempo real
-- `MiniXception`: classificacao de emocao facial
+- `MediaPipe Face Detector`: deteccao facial em tempo real com modelo de visao empacotado em `TFLite`
+- `MiniXception`: classificacao de emocao facial com rede neural convolucional (`CNN`)
 
 O modelo `MiniXception` usado neste projeto foi treinado no dataset `FER-2013`.
+
+Nesta etapa do pipeline:
+
+- o `MediaPipe` faz localizacao de rosto
+- o `MiniXception` faz classificacao da emocao do rosto recortado
+- nenhum desses componentes eh modelo de linguagem
 
 Emocoes exibidas no video:
 
@@ -87,12 +114,18 @@ O script tambem deriva um sentimento simplificado para o video:
 
 ### Audio
 
-- `sounddevice`: captura de audio do microfone
-- `Vosk`: transcricao offline em streaming
-- `openSMILE`: extracao de features acustico-prosodicas da voz
-- `SYAS1-PTBR`: sentimento textual em portugues com `transformers`
+- `sounddevice`: captura de audio do microfone; biblioteca de I/O, nao ML
+- `Vosk`: transcricao offline em streaming; motor de `ASR`, nao `LLM`
+- `openSMILE`: extracao de features acustico-prosodicas da voz; extrator de sinais, nao classificador final
+- `SYAS1-PTBR`: sentimento textual em portugues com `transformers`; classificador `Transformer`
 
-O sentimento atual do audio usa inferencia local com Transformer. O modelo eh baixado automaticamente para `models/SYAS1-PTBR/` na primeira execucao, caso ainda nao exista localmente.
+O sentimento atual do audio usa inferencia local com `Transformer`. O modelo eh baixado automaticamente para `models/SYAS1-PTBR/` na primeira execucao, caso ainda nao exista localmente.
+
+Separando os papeis dentro do audio:
+
+- a transcricao da fala vem do `Vosk`, que eh um sistema de reconhecimento automatico de fala offline
+- a classificacao de sentimento do texto vem do `SYAS1-PTBR`, que eh um modelo `Transformer` de classificacao
+- a leitura do tom de voz nao usa o `Transformer`; ela segue por outro ramo baseado em `openSMILE` + heuristica
 
 Regras atuais para sentimento do audio:
 
@@ -102,7 +135,7 @@ Regras atuais para sentimento do audio:
 
 ### Voz
 
-O tom de voz eh avaliado separadamente do sentimento textual. O `openSMILE` extrai features do conjunto `eGeMAPSv02`, e uma heuristica converte esses sinais em uma emocao candidata da voz:
+O tom de voz eh avaliado separadamente do sentimento textual. Esta parte do sistema nao usa `LLM`, nao usa `Transformer` e nao usa um classificador neural dedicado para emocao da voz. O `openSMILE` extrai features do conjunto `eGeMAPSv02`, e uma heuristica converte esses sinais em uma emocao candidata da voz:
 
 - `Alegria`
 - `Tristeza`
@@ -116,6 +149,8 @@ Base conceitual da heuristica:
 
 - o `openSMILE` continua sendo tratado como um extrator de caracteristicas brutas
 - no projeto, ele e usado para capturar medidas acustico-prosodicas como `frequencia fundamental/F0`, `intensidade/loudness` e `duracao`
+- o `openSMILE` nao decide a emocao sozinho; ele apenas entrega medidas numericas para a camada heuristica
+- a decisao final da emocao da voz eh feita por regras no codigo, com comparacao contra baseline e agregacao por pontuacao
 - a heuristica foi documentada a partir de trabalhos que relacionam explicitamente essas medidas com as emocoes basicas em falantes do portugues brasileiro
 
 Sinais usados pela heuristica:
@@ -250,9 +285,9 @@ Para sair da janela do video, pressione `q`.
 ## Observacoes
 
 - o script usa `MediaPipe Tasks`, nao a API antiga `mp.solutions`
-- o Vosk foi escolhido nesta fase por ser offline, leve e orientado a streaming
-- o `openSMILE` foi adicionado para capturar sinais paralinguisticos do tom de voz sem depender de modelo de audio pesado
-- o sentimento textual do audio usa `SYAS1-PTBR` via `transformers`
+- o Vosk foi escolhido nesta fase por ser offline, leve e orientado a streaming; ele cobre a transcricao, nao a classificacao de sentimento
+- o `openSMILE` foi adicionado para capturar sinais paralinguisticos do tom de voz sem depender de modelo de audio pesado; ele extrai features, mas nao eh o classificador final
+- o sentimento textual do audio usa `SYAS1-PTBR` via `transformers`; este eh o bloco `Transformer` do projeto
 - as inferencias mais pesadas foram desacopladas para reduzir travamentos da interface
 - o overlay do texto usa fontes do Windows para texto e emoji
 - o estado atual eh de desenvolvimento local com intencao edge, nao de deploy final em dispositivo offline
